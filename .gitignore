@@ -18,6 +18,9 @@ gh-pages/
 .idea
 .claude
 
+# Codex
+.codex/
+
 # Environment files (may contain secrets)
 .env
 
