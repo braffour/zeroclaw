@@ -3348,9 +3348,13 @@ pub enum CommandContextRuleAction {
     Allow,
     /// Matching context is explicitly denied.
     Deny,
+    /// Matching context requires interactive approval in supervised mode.
+    ///
+    /// This does not allow a command by itself; allowlist and deny checks still apply.
+    RequireApproval,
 }
 
-/// Context-aware allow/deny rule for shell commands.
+/// Context-aware command rule for shell commands.
 ///
 /// Rules are evaluated per command segment. Command matching accepts command
 /// names (`curl`), explicit paths (`/usr/bin/curl`), and wildcard (`*`).
@@ -3359,6 +3363,8 @@ pub enum CommandContextRuleAction {
 /// - `action = "deny"`: if all constraints match, the segment is rejected.
 /// - `action = "allow"`: if at least one allow rule exists for a command,
 ///   segments must match at least one of those allow rules.
+/// - `action = "require_approval"`: matching segments require explicit
+///   `approved=true` in supervised mode, even when `shell` is auto-approved.
 ///
 /// Constraints are optional:
 /// - `allowed_domains`: require URL arguments to match these hosts/patterns.
@@ -3371,7 +3377,7 @@ pub struct CommandContextRuleConfig {
     /// Command name/path pattern (`git`, `/usr/bin/curl`, or `*`).
     pub command: String,
 
-    /// Rule action (`allow` | `deny`). Defaults to `allow`.
+    /// Rule action (`allow` | `deny` | `require_approval`). Defaults to `allow`.
     #[serde(default)]
     pub action: CommandContextRuleAction,
 
@@ -5636,7 +5642,7 @@ impl FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecurityConfig {
     /// Sandbox configuration
     #[serde(default)]
@@ -5674,9 +5680,31 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub outbound_leak_guard: OutboundLeakGuardConfig,
 
+    /// Enable per-turn canary tokens to detect system-context exfiltration.
+    #[serde(default = "default_true")]
+    pub canary_tokens: bool,
+
     /// Shared URL access policy for network-enabled tools.
     #[serde(default)]
     pub url_access: UrlAccessConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: SandboxConfig::default(),
+            resources: ResourceLimitsConfig::default(),
+            audit: AuditConfig::default(),
+            otp: OtpConfig::default(),
+            roles: Vec::default(),
+            estop: EstopConfig::default(),
+            syscall_anomaly: SyscallAnomalyConfig::default(),
+            perplexity_filter: PerplexityFilterConfig::default(),
+            outbound_leak_guard: OutboundLeakGuardConfig::default(),
+            canary_tokens: true,
+            url_access: UrlAccessConfig::default(),
+        }
+    }
 }
 
 /// Outbound leak handling mode for channel responses.
@@ -9833,6 +9861,34 @@ allowed_roots = []
     }
 
     #[test]
+    async fn autonomy_command_context_rule_supports_require_approval_action() {
+        let raw = r#"
+level = "supervised"
+workspace_only = true
+allowed_commands = ["ls", "rm"]
+forbidden_paths = ["/etc"]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = []
+auto_approve = ["shell"]
+always_ask = []
+allowed_roots = []
+
+[[command_context_rules]]
+command = "rm"
+action = "require_approval"
+"#;
+        let parsed: AutonomyConfig = toml::from_str(raw).expect("autonomy config should parse");
+        assert_eq!(parsed.command_context_rules.len(), 1);
+        assert_eq!(
+            parsed.command_context_rules[0].action,
+            CommandContextRuleAction::RequireApproval
+        );
+    }
+
+    #[test]
     async fn config_validate_rejects_duplicate_non_cli_excluded_tools() {
         let mut cfg = Config::default();
         cfg.autonomy.non_cli_excluded_tools = vec!["shell".into(), "shell".into()];
@@ -11232,6 +11288,33 @@ channel_id = "C123"
         assert_eq!(
             parsed.group_reply_allowed_sender_ids(),
             vec!["U111".to_string()]
+        );
+    }
+
+    #[test]
+    async fn channels_slack_group_reply_toml_nested_table_deserializes() {
+        let toml_str = r#"
+cli = true
+
+[slack]
+bot_token = "xoxb-tok"
+app_token = "xapp-tok"
+channel_id = "C123"
+allowed_users = ["*"]
+
+[slack.group_reply]
+mode = "mention_only"
+allowed_sender_ids = ["U111", "U222"]
+"#;
+        let parsed: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        let slack = parsed.slack.expect("slack config should exist");
+        assert_eq!(
+            slack.effective_group_reply_mode(),
+            GroupReplyMode::MentionOnly
+        );
+        assert_eq!(
+            slack.group_reply_allowed_sender_ids(),
+            vec!["U111".to_string(), "U222".to_string()]
         );
     }
 
@@ -14129,6 +14212,7 @@ default_temperature = 0.7
             OutboundLeakGuardAction::Redact
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.7);
+        assert!(parsed.security.canary_tokens);
     }
 
     #[test]
@@ -14138,6 +14222,9 @@ default_temperature = 0.7
 default_provider = "openrouter"
 default_model = "anthropic/claude-sonnet-4.6"
 default_temperature = 0.7
+
+[security]
+canary_tokens = false
 
 [security.otp]
 enabled = true
@@ -14220,6 +14307,7 @@ sensitivity = 0.9
             OutboundLeakGuardAction::Block
         );
         assert_eq!(parsed.security.outbound_leak_guard.sensitivity, 0.9);
+        assert!(!parsed.security.canary_tokens);
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         assert_eq!(
