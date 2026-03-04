@@ -2113,30 +2113,35 @@ pub async fn run_tool_call_loop(
                     channel_name != "cli" && mgr.is_non_cli_session_granted(&tool_name);
                 let requires_interactive_approval =
                     mgr.needs_approval_for_call(&tool_name, &tool_args);
-                if (bypass_non_cli_approval_for_turn || non_cli_session_granted)
-                    && !requires_interactive_approval
-                {
+                if bypass_non_cli_approval_for_turn {
+                    // One-time bypass token: bypass ALL approvals (including interactive)
                     mgr.record_decision(
                         &tool_name,
                         &tool_args,
                         ApprovalResponse::Yes,
                         channel_name,
                     );
-                    if non_cli_session_granted {
-                        runtime_trace::record_event(
-                            "approval_bypass_non_cli_session_grant",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(active_model.as_str()),
-                            Some(&turn_id),
-                            Some(true),
-                            Some("using runtime non-cli session approval grant"),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                            }),
-                        );
-                    }
+                } else if non_cli_session_granted && !requires_interactive_approval {
+                    // Session grant: bypass only non-interactive approvals
+                    mgr.record_decision(
+                        &tool_name,
+                        &tool_args,
+                        ApprovalResponse::Yes,
+                        channel_name,
+                    );
+                    runtime_trace::record_event(
+                        "approval_bypass_non_cli_session_grant",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(active_model.as_str()),
+                        Some(&turn_id),
+                        Some(true),
+                        Some("using runtime non-cli session approval grant"),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": tool_name.clone(),
+                        }),
+                    );
                 } else if requires_interactive_approval {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
@@ -2713,6 +2718,7 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -3418,6 +3424,7 @@ pub async fn process_message_with_session(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_auth_header: config.effective_custom_provider_auth_header(),
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -4733,7 +4740,10 @@ mod tests {
             Arc::clone(&max_active),
         ))];
 
-        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig::default());
+        let approval_mgr = ApprovalManager::from_config(&crate::config::AutonomyConfig {
+            auto_approve: vec!["shell".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        });
         approval_mgr.grant_non_cli_session("shell");
 
         let mut history = vec![
@@ -4922,6 +4932,7 @@ mod tests {
             &[],
             ProgressMode::Verbose,
             None,
+            false,
         )
         .await
         .expect("tool loop should continue after non-cli approval");
