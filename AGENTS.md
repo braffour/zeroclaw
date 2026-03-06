@@ -387,6 +387,16 @@ Notes:
 - Local Docker-based CI is strongly recommended when Docker is available.
 - Contributors are not blocked from opening a PR if local Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
 
+Regular secret scanning requirement (recurring):
+- Run `gitleaks` on a regular cadence for code and docs changes:
+  - At least once per PR, before merge.
+  - At least weekly in active workstreams or whenever secrets are imported/modified.
+  - If available in local setup, run before creating commits.
+- Use the project-standard execution pattern where `gitleaks` is available:
+  - `gitleaks detect --source . --verbose --redact`
+- Add any remaining `gitleaks` gap or false-positive handling to PR notes as follow-up actions
+  before merging.
+
 Additional expectations by change type:
 
 - **Docs/template-only**:

@@ -112,8 +112,8 @@
 ## Success Criteria *(mandatory)*
 
 <!--
-  ACTION REQUIRED: The content in this section represents placeholders.
-  Fill them out with the right measurable requirements.
+  ACTION REQUIRED: Define measurable success criteria.
+  These must be technology-agnostic and measurable.
 -->
 
 ### Measurable Outcomes

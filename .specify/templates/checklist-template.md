@@ -9,29 +9,32 @@
 <!-- 
   ============================================================================
   IMPORTANT: The checklist items below are SAMPLE ITEMS for illustration only.
+  
   The /speckit.checklist command MUST replace these with actual items based on:
   - User's specific checklist request
   - Feature requirements from spec.md
   - Technical context from plan.md
   - Implementation details from tasks.md
-  DO NOT keep these sample items in generated files.
+  
+  DO NOT keep these sample items in the generated checklist file.
   ============================================================================
 -->
 
 ## [Category 1]
 
-- [ ] CHK001 Verify trait/factory compatibility and avoid cross-subsystem coupling
-- [ ] CHK002 Confirm security posture for provider/channel/tool/peripheral boundaries
-- [ ] CHK003 Confirm explicit failure-mode handling (no silent fallback)
+- [ ] CHK001 First checklist item with clear action
+- [ ] CHK002 Second checklist item
+- [ ] CHK003 Third checklist item
 
 ## [Category 2]
 
-- [ ] CHK004 Add required observability and traceability instrumentation
-- [ ] CHK005 Validate configuration and contract docs are updated and version-safe
-- [ ] CHK006 Validate rollback and migration notes are documented
+- [ ] CHK004 Another category item
+- [ ] CHK005 Item with specific criteria
+- [ ] CHK006 Final item in this category
 
 ## Notes
 
 - Check items off as completed: `[x]`
 - Add comments or findings inline
+- Link to relevant resources or documentation
 - Items are numbered sequentially for easy reference
