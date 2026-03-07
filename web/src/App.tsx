@@ -29,7 +29,13 @@ export const LocaleContext = createContext<LocaleContextType>({
 export const useLocaleContext = () => useContext(LocaleContext);
 
 // Pairing dialog component
-function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
+function PairingDialog({
+  onPair,
+  notice,
+}: {
+  onPair: (code: string) => Promise<void>;
+  notice?: string | null;
+}) {
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -64,8 +70,15 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             maxLength={6}
             autoFocus
           />
+          {notice && (
+            <p className="text-amber-300 text-sm mb-4 text-center" role="status">
+              {notice}
+            </p>
+          )}
           {error && (
-            <p className="text-red-400 text-sm mb-4 text-center">{error}</p>
+            <p className="text-red-400 text-sm mb-4 text-center" role="alert">
+              {error}
+            </p>
           )}
           <button
             type="submit"
@@ -83,6 +96,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 function AppContent() {
   const { isAuthenticated, loading, pair, logout } = useAuth();
   const [locale, setLocaleState] = useState<Locale>('tr');
+  const [pairingNotice, setPairingNotice] = useState<string | null>(null);
 
   const setAppLocale = (newLocale: Locale) => {
     setLocaleState(newLocale);
@@ -92,11 +106,18 @@ function AppContent() {
   // Listen for 401 events to force logout
   useEffect(() => {
     const handler = () => {
+      setPairingNotice('Session expired. Please enter a new pairing code.');
       logout();
     };
     window.addEventListener('zeroclaw-unauthorized', handler);
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
   }, [logout]);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      setPairingNotice(null);
+    }
+  }, [isAuthenticated]);
 
   if (loading) {
     return (
@@ -107,7 +128,7 @@ function AppContent() {
   }
 
   if (!isAuthenticated) {
-    return <PairingDialog onPair={pair} />;
+    return <PairingDialog onPair={pair} notice={pairingNotice} />;
   }
 
   return (
