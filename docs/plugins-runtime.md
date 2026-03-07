@@ -10,24 +10,31 @@ Current implementation supports:
 - plugin-declared tool registration into tool specs
 - plugin-declared provider registration into provider factory resolution
 - host-side WASM invocation bridge for tool/provider calls
-- manifest fingerprint tracking scaffolding (hot-reload toggle is not yet exposed in schema)
+- manifest fingerprint tracking scaffolding and optional runtime hot-reload controls
 
 ## Config
 
 ```toml
 [plugins]
 enabled = true
+hot_reload = false
 load_paths = ["plugins"]
+limits = { invoke_timeout_ms = 2000, memory_limit_bytes = 67108864, max_concurrency = 8 }
 allow = []
 deny = []
 ```
 
 Defaults are deny-by-default and disabled-by-default.
-Execution limits are currently conservative fixed defaults in runtime code:
+Execution limits are conservative and now exposed as config:
 
 - `invoke_timeout_ms = 2000`
 - `memory_limit_bytes = 67108864`
 - `max_concurrency = 8`
+
+Hot-reload behavior:
+
+- `hot_reload = false`: manifests are loaded once at startup.
+- `hot_reload = true`: manifests are reloaded when file fingerprints change.
 
 ## Manifest Files
 
@@ -115,9 +122,10 @@ If `error` is non-null, host treats the call as failed.
 
 ## Hot Reload
 
-Manifest fingerprints are tracked internally, but the config schema does not currently expose a
-`[plugins].hot_reload` toggle. Runtime hot-reload remains disabled by default until that schema
-support is added.
+Manifest fingerprints are tracked internally and `hot_reload` is controlled by `[plugins].hot_reload`.
+
+When enabled, the runtime refreshes its in-memory registry when plugin manifest fingerprints change.
+When disabled, manifests are loaded only during initialization.
 
 ## Observer Bridge
 

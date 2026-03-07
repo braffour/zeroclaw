@@ -12,13 +12,17 @@ use wasmtime::{Engine, Extern, Instance, Memory, Module, Store, TypedFunc};
 use super::manifest::PluginManifest;
 use super::registry::PluginRegistry;
 use crate::config::PluginsConfig;
+#[cfg(test)]
+use crate::config::PluginsLimitsConfig;
 use crate::tools::ToolResult;
 
 const ABI_TOOL_EXEC_FN: &str = "zeroclaw_tool_execute";
 const ABI_PROVIDER_CHAT_FN: &str = "zeroclaw_provider_chat";
 const ABI_ALLOC_FN: &str = "alloc";
 const ABI_DEALLOC_FN: &str = "dealloc";
-const MAX_WASM_PAYLOAD_BYTES_FALLBACK: usize = 4 * 1024 * 1024;
+const DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_PLUGIN_MAX_CONCURRENCY: usize = 8;
 type WasmAbiModule = (
     Store<()>,
     Instance,
@@ -168,8 +172,14 @@ fn unpack_ptr_len(packed: i64) -> Result<(i32, i32)> {
     Ok((ptr, len))
 }
 
-fn call_wasm_json(module_path: &str, fn_name: &str, input_json: &str) -> Result<String> {
-    if input_json.len() > MAX_WASM_PAYLOAD_BYTES_FALLBACK {
+fn call_wasm_json(
+    module_path: &str,
+    fn_name: &str,
+    input_json: &str,
+    memory_limit_bytes: u64,
+) -> Result<String> {
+    let max_payload = usize::try_from(memory_limit_bytes).unwrap_or(usize::MAX);
+    if input_json.len() > max_payload {
         anyhow::bail!("wasm input payload exceeds safety limit");
     }
     let (mut store, instance, memory, alloc, dealloc) = instantiate_module(module_path)?;
@@ -184,7 +194,7 @@ fn call_wasm_json(module_path: &str, fn_name: &str, input_json: &str) -> Result<
     let _ = dealloc.call(&mut store, (in_ptr, in_len));
 
     let (out_ptr, out_len) = unpack_ptr_len(packed)?;
-    if usize::try_from(out_len).unwrap_or(usize::MAX) > MAX_WASM_PAYLOAD_BYTES_FALLBACK {
+    if usize::try_from(out_len).unwrap_or(usize::MAX) > max_payload {
         anyhow::bail!("wasm output payload exceeds safety limit");
     }
     let out_bytes = read_guest_bytes(&mut store, &memory, out_ptr, out_len)?;
@@ -195,13 +205,16 @@ fn call_wasm_json(module_path: &str, fn_name: &str, input_json: &str) -> Result<
 
 fn semaphore_cell() -> &'static RwLock<Arc<Semaphore>> {
     static CELL: OnceLock<RwLock<Arc<Semaphore>>> = OnceLock::new();
-    CELL.get_or_init(|| RwLock::new(Arc::new(Semaphore::new(8))))
+    CELL.get_or_init(|| RwLock::new(Arc::new(Semaphore::new(
+        DEFAULT_PLUGIN_MAX_CONCURRENCY,
+    ))))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PluginExecutionLimits {
     invoke_timeout_ms: u64,
     memory_limit_bytes: u64,
+    max_concurrency: usize,
 }
 
 fn current_limits() -> PluginExecutionLimits {
@@ -209,6 +222,36 @@ fn current_limits() -> PluginExecutionLimits {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.limits
+}
+
+fn runtime_limits_from_config(config: &PluginsConfig) -> Result<PluginExecutionLimits> {
+    if config.limits.invoke_timeout_ms == 0 {
+        anyhow::bail!("plugins.limits.invoke_timeout_ms must be greater than 0");
+    }
+    if config.limits.memory_limit_bytes == 0 {
+        anyhow::bail!("plugins.limits.memory_limit_bytes must be greater than 0");
+    }
+    if config.limits.max_concurrency == 0 {
+        anyhow::bail!("plugins.limits.max_concurrency must be greater than 0");
+    }
+    Ok(PluginExecutionLimits {
+        invoke_timeout_ms: config.limits.invoke_timeout_ms,
+        memory_limit_bytes: config.limits.memory_limit_bytes,
+        max_concurrency: config.limits.max_concurrency,
+    })
+}
+
+fn apply_runtime_limits(limits: PluginExecutionLimits) -> Result<()> {
+    let mut guard = registry_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.limits = limits;
+    drop(guard);
+    let mut sem_guard = semaphore_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *sem_guard = Arc::new(Semaphore::new(limits.max_concurrency));
+    Ok(())
 }
 
 async fn call_wasm_json_limited(
@@ -221,14 +264,13 @@ async fn call_wasm_json_limited(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let max_by_config = usize::try_from(limits.memory_limit_bytes).unwrap_or(usize::MAX);
-    let max_payload = max_by_config.min(MAX_WASM_PAYLOAD_BYTES_FALLBACK);
+    let max_payload = usize::try_from(limits.memory_limit_bytes).unwrap_or(usize::MAX);
     if payload.len() > max_payload {
         anyhow::bail!("plugin payload exceeds configured memory limit");
     }
 
     run_blocking_with_timeout(semaphore, limits.invoke_timeout_ms, move || {
-        call_wasm_json(&module_path, fn_name, &payload)
+        call_wasm_json(&module_path, fn_name, &payload, limits.memory_limit_bytes)
     })
     .await
 }
@@ -335,8 +377,9 @@ impl Default for RuntimeState {
             config: None,
             fingerprints: HashMap::new(),
             limits: PluginExecutionLimits {
-                invoke_timeout_ms: 2_000,
-                memory_limit_bytes: 64 * 1024 * 1024,
+                invoke_timeout_ms: DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS,
+                memory_limit_bytes: DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES,
+                max_concurrency: DEFAULT_PLUGIN_MAX_CONCURRENCY,
             },
         }
     }
@@ -388,7 +431,19 @@ fn maybe_hot_reload() {
     let Some(config) = config else {
         return;
     };
+
+    let limits = match runtime_limits_from_config(&config) {
+        Ok(limits) => limits,
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid plugin limits in config; skipping hot reload");
+            return;
+        }
+    };
     let current_fingerprints = collect_manifest_fingerprints(&config.load_paths);
+    if let Err(err) = apply_runtime_limits(limits) {
+        tracing::warn!(error = %err, "failed to apply plugin runtime limits");
+    }
+
     if current_fingerprints == previous_fingerprints {
         return;
     }
@@ -430,12 +485,12 @@ pub fn initialize_from_config(config: &PluginsConfig) -> Result<()> {
     let runtime = PluginRuntime::new();
     let registry = runtime.load_registry_from_config(config)?;
     let fingerprints = collect_manifest_fingerprints(&config.load_paths);
+    let limits = runtime_limits_from_config(config)?;
     let mut guard = registry_cell()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.registry = registry;
-    // Keep hot-reload disabled by default until schema-level controls are added.
-    guard.hot_reload = false;
+    guard.hot_reload = config.hot_reload;
     guard.config = Some(config.clone());
     guard.fingerprints = fingerprints;
     {
@@ -444,15 +499,12 @@ pub fn initialize_from_config(config: &PluginsConfig) -> Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *fp_guard = Some(fingerprint);
     }
-    // Use conservative defaults until plugins.limits is exposed in config schema.
-    guard.limits = PluginExecutionLimits {
-        invoke_timeout_ms: 2_000,
-        memory_limit_bytes: 64 * 1024 * 1024,
-    };
+    guard.limits = limits;
+    drop(guard);
     let mut sem_guard = semaphore_cell()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *sem_guard = Arc::new(Semaphore::new(8));
+    *sem_guard = Arc::new(Semaphore::new(limits.max_concurrency));
     Ok(())
 }
 
@@ -469,6 +521,30 @@ pub fn current_registry() -> PluginRegistry {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn lock_runtime_state_for_tests() -> std::sync::MutexGuard<'static, ()> {
+        static STATE_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        STATE_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("runtime state test mutex should not be poisoned")
+    }
+
+    fn reset_runtime_state_for_tests() {
+        let mut guard = registry_cell()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = RuntimeState::default();
+        drop(guard);
+        let mut fp_guard = init_fingerprint_cell()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *fp_guard = None;
+        let mut sem_guard = semaphore_cell()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *sem_guard = Arc::new(Semaphore::new(DEFAULT_PLUGIN_MAX_CONCURRENCY));
+    }
 
     fn write_manifest(dir: &std::path::Path, id: &str, provider: &str, tool: &str) {
         let manifest_path = dir.join(format!("{id}.plugin.toml"));
@@ -499,6 +575,8 @@ description = "{tool} description"
 
     #[test]
     fn runtime_loads_plugin_manifest_files() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
         let dir = TempDir::new().expect("temp dir");
         write_manifest(dir.path(), "demo", "demo-provider", "demo_tool");
 
@@ -529,7 +607,132 @@ description = "{tool} description"
     }
 
     #[test]
+    fn initialize_from_config_uses_hardcoded_defaults_when_limits_omitted() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
+
+        let cfg = PluginsConfig {
+            enabled: true,
+            ..PluginsConfig::default()
+        };
+        initialize_from_config(&cfg).expect("initialization should succeed");
+        let limits = current_limits();
+        assert_eq!(limits.invoke_timeout_ms, DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS);
+        assert_eq!(limits.memory_limit_bytes, DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES);
+        assert_eq!(limits.max_concurrency, DEFAULT_PLUGIN_MAX_CONCURRENCY);
+        let semaphore = semaphore_cell()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(semaphore.available_permits(), DEFAULT_PLUGIN_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn initialize_from_config_rejects_invalid_limits() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
+
+        let cfg = PluginsConfig {
+            enabled: true,
+            limits: PluginsLimitsConfig {
+                invoke_timeout_ms: 0,
+                ..PluginsLimitsConfig::default()
+            },
+            ..PluginsConfig::default()
+        };
+        assert!(
+            initialize_from_config(&cfg).is_err(),
+            "invalid invoke_timeout_ms should fail"
+        );
+    }
+
+    #[test]
+    fn initialize_from_config_applies_custom_limits() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
+
+        let limits = PluginsLimitsConfig {
+            invoke_timeout_ms: 111,
+            memory_limit_bytes: 512 * 1024,
+            max_concurrency: 4,
+        };
+        let cfg = PluginsConfig {
+            enabled: true,
+            limits: limits.clone(),
+            ..PluginsConfig::default()
+        };
+        initialize_from_config(&cfg).expect("initialization should succeed");
+        let current = current_limits();
+        assert_eq!(current.invoke_timeout_ms, limits.invoke_timeout_ms);
+        assert_eq!(current.memory_limit_bytes, limits.memory_limit_bytes);
+        assert_eq!(current.max_concurrency, limits.max_concurrency);
+        let semaphore = semaphore_cell()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn maybe_hot_reload_respects_hot_reload_toggle() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
+
+        let dir = TempDir::new().expect("temp dir");
+        write_manifest(dir.path(), "reload_a", "reload-provider-a-for-runtime-test", "reload_tool_a");
+
+        let cfg_disabled = PluginsConfig {
+            enabled: true,
+            hot_reload: false,
+            load_paths: vec![dir.path().to_string_lossy().to_string()],
+            ..PluginsConfig::default()
+        };
+        initialize_from_config(&cfg_disabled).expect("first initialization");
+        let registry = current_registry();
+        assert!(registry.has_provider("reload-provider-a-for-runtime-test"));
+
+        write_manifest(
+            dir.path(),
+            "reload_b",
+            "reload-provider-b-for-runtime-test",
+            "reload_tool_b",
+        );
+        let registry = current_registry();
+        assert!(!registry.has_provider("reload-provider-b-for-runtime-test"));
+    }
+
+    #[tokio::test]
+    async fn maybe_hot_reload_refreshes_plugin_registry_when_enabled() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
+
+        let dir = TempDir::new().expect("temp dir");
+        write_manifest(dir.path(), "reload_c", "reload-provider-c-for-runtime-test", "reload_tool_c");
+
+        let cfg_enabled = PluginsConfig {
+            enabled: true,
+            hot_reload: true,
+            load_paths: vec![dir.path().to_string_lossy().to_string()],
+            ..PluginsConfig::default()
+        };
+        initialize_from_config(&cfg_enabled).expect("initialization with hot-reload");
+
+        write_manifest(
+            dir.path(),
+            "reload_d",
+            "reload-provider-d-for-runtime-test",
+            "reload_tool_d",
+        );
+
+        let registry = current_registry();
+        assert!(registry.has_provider("reload-provider-c-for-runtime-test"));
+        assert!(registry.has_provider("reload-provider-d-for-runtime-test"));
+    }
+
+    #[test]
     fn initialize_from_config_applies_updated_plugin_dirs() {
+        let _guard = lock_runtime_state_for_tests();
+        reset_runtime_state_for_tests();
         let dir_a = TempDir::new().expect("temp dir a");
         let dir_b = TempDir::new().expect("temp dir b");
         write_manifest(

@@ -3263,6 +3263,17 @@ pub struct PluginsConfig {
     #[serde(default = "default_plugins_enabled")]
     pub enabled: bool,
 
+    /// Enable runtime plugin manifest hot-reload on invocation paths.
+    /// Default: `false`.
+    #[serde(default = "default_plugins_hot_reload")]
+    pub hot_reload: bool,
+
+    /// Runtime invocation limits for plugin execution.
+    ///
+    /// These limits apply to plugin JSON payload sizes and concurrency scheduling.
+    #[serde(default)]
+    pub limits: PluginsLimitsConfig,
+
     /// Allowlist — if non-empty, only plugins with these IDs are loaded.
     /// An empty list means all discovered plugins are eligible.
     #[serde(default)]
@@ -3287,10 +3298,61 @@ fn default_plugins_enabled() -> bool {
     true
 }
 
+fn default_plugins_hot_reload() -> bool {
+    false
+}
+
+const DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_PLUGIN_MAX_CONCURRENCY: usize = 8;
+
+/// Execution limits for plugin runtime invocations (`[plugins.limits]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginsLimitsConfig {
+    /// Maximum timeout in milliseconds for a single plugin invocation.
+    /// Default: `2000`.
+    #[serde(default = "default_plugin_invoke_timeout_ms")]
+    pub invoke_timeout_ms: u64,
+
+    /// Maximum plugin payload size in bytes.
+    /// Default: `67108864` (64 MiB).
+    #[serde(default = "default_plugin_memory_limit_bytes")]
+    pub memory_limit_bytes: u64,
+
+    /// Maximum concurrent plugin invocations.
+    /// Default: `8`.
+    #[serde(default = "default_plugin_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+fn default_plugin_invoke_timeout_ms() -> u64 {
+    DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS
+}
+
+fn default_plugin_memory_limit_bytes() -> u64 {
+    DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES
+}
+
+fn default_plugin_max_concurrency() -> usize {
+    DEFAULT_PLUGIN_MAX_CONCURRENCY
+}
+
+impl Default for PluginsLimitsConfig {
+    fn default() -> Self {
+        Self {
+            invoke_timeout_ms: DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS,
+            memory_limit_bytes: DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES,
+            max_concurrency: DEFAULT_PLUGIN_MAX_CONCURRENCY,
+        }
+    }
+}
+
 impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            hot_reload: false,
+            limits: PluginsLimitsConfig::default(),
             allow: Vec::new(),
             deny: Vec::new(),
             load_paths: Vec::new(),
@@ -8062,6 +8124,15 @@ impl Config {
                 "security.url_access.enforce_domain_allowlist=true requires non-empty security.url_access.domain_allowlist"
             );
         }
+        if self.plugins.limits.invoke_timeout_ms == 0 {
+            anyhow::bail!("plugins.limits.invoke_timeout_ms must be greater than 0");
+        }
+        if self.plugins.limits.memory_limit_bytes == 0 {
+            anyhow::bail!("plugins.limits.memory_limit_bytes must be greater than 0");
+        }
+        if self.plugins.limits.max_concurrency == 0 {
+            anyhow::bail!("plugins.limits.max_concurrency must be greater than 0");
+        }
         let mut seen_http_credential_profiles = std::collections::HashSet::new();
         for (profile_name, profile) in &self.http_request.credential_profiles {
             let normalized_name = profile_name.trim();
@@ -9583,6 +9654,57 @@ mod tests {
         c.wasm = WasmConfig::default();
         c.wasm.registry_url = "https://?q=1".to_string();
         assert!(c.validate().is_err(), "https://?q=1 should fail");
+    }
+
+    #[test]
+    async fn plugins_config_has_hardening_defaults() {
+        let plugins = PluginsConfig::default();
+        assert!(!plugins.hot_reload);
+        assert_eq!(
+            plugins.limits.invoke_timeout_ms,
+            DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS
+        );
+        assert_eq!(
+            plugins.limits.memory_limit_bytes,
+            DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(plugins.limits.max_concurrency, DEFAULT_PLUGIN_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    async fn plugins_config_backward_compat_deserializes_without_hot_reload_or_limits() {
+        let raw = r#"
+[plugins]
+enabled = true
+load_paths = ["plugins"]
+"#;
+        let plugins: PluginsConfig = toml::from_str(raw).unwrap();
+        assert!(plugins.enabled);
+        assert!(!plugins.hot_reload);
+        assert_eq!(
+            plugins.limits.invoke_timeout_ms,
+            DEFAULT_PLUGIN_INVOKE_TIMEOUT_MS
+        );
+        assert_eq!(
+            plugins.limits.memory_limit_bytes,
+            DEFAULT_PLUGIN_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(plugins.limits.max_concurrency, DEFAULT_PLUGIN_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    async fn config_validate_rejects_invalid_plugin_limits() {
+        let mut config = Config::default();
+        config.plugins.limits.invoke_timeout_ms = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.plugins.limits.memory_limit_bytes = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.plugins.limits.max_concurrency = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

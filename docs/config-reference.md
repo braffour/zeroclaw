@@ -601,7 +601,31 @@ Notes:
 - `module_hash_policy = "warn"` allows execution but logs missing/mismatched digests.
 - `module_hash_policy = "enforce"` blocks execution on missing/mismatched digests and requires at least one pin.
 
-WASM profile templates:
+## `[plugins]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Master switch for plugin discovery/loading |
+| `hot_reload` | `false` | Reload plugin registry on each invocation when manifests change |
+| `allow` | `[]` | Optional allowlist of plugin IDs |
+| `deny` | `[]` | Optional denylist of plugin IDs |
+| `load_paths` | `[]` | Extra plugin search paths |
+
+Notes:
+
+- `hot_reload` default is conservative (`false`) and keeps plugin behavior stable unless explicitly enabled.
+- `allow` and `deny` filters apply after discovery of eligible manifests.
+- Missing plugin config fields keep existing conservative defaults.
+
+### `[plugins.limits]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `invoke_timeout_ms` | `2000` | Per-invocation plugin timeout (ms) |
+| `memory_limit_bytes` | `67108864` | Payload max size (bytes) used in invocation validation |
+| `max_concurrency` | `8` | Max concurrent plugin invocations |
+
+### WASM profile templates
 
 - `dev/config.wasm.dev.toml`
 - `dev/config.wasm.staging.toml`
